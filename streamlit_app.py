@@ -234,3 +234,88 @@ with comp_right:
     fig_comp_bar.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
     fig_comp_bar.update_layout(yaxis_title="단계 전환율 (%)", xaxis_title="")
     st.plotly_chart(fig_comp_bar, width="stretch")
+
+st.divider()
+
+# ------------------------------------------------------------
+# 5. 드릴다운: 언제부터, 무엇 때문일까 영역
+# ------------------------------------------------------------
+st.header("드릴다운: 언제부터, 무엇 때문일까")
+
+# 고른 축(group_col_choice)에 따라 f에 존재하는 값 목록 추출
+available_groups = sorted(f[group_col_choice].unique())
+
+drill_col1, drill_col2 = st.columns(2)
+with drill_col1:
+    selected_group = st.selectbox("자세히 볼 집단", options=available_groups)
+with drill_col2:
+    selected_step_name = st.selectbox(
+        "단계",
+        options=["방문 → 식당조회", "식당조회 → 장바구니", "장바구니 → 결제시작", "결제시작 → 주문"]
+    )
+
+# 단계별 컬럼 매핑 (직전 단계, 현재 단계)
+step_column_mapping = {
+    "방문 → 식당조회": ("세션수", "조회세션"),
+    "식당조회 → 장바구니": ("조회세션", "장바구니세션"),
+    "장바구니 → 결제시작": ("장바구니세션", "결제시작세션"),
+    "결제시작 → 주문": ("결제시작세션", "주문세션")
+}
+prev_col, curr_col = step_column_mapping[selected_step_name]
+
+# 다른 축 설정 (플랫폼이면 유입경로, 유입경로면 플랫폼)
+other_col = "유입경로" if group_col_choice == "플랫폼" else "플랫폼"
+
+# 주별 × 다른 축별로 집계
+weekly_drill = f.groupby(["주시작일", group_col_choice, other_col])[[prev_col, curr_col]].sum().reset_index()
+
+# 선택한 집단만 필터링
+weekly_drill_filtered = weekly_drill[weekly_drill[group_col_choice] == selected_group].copy()
+
+# 전환율 계산 (직전 단계 세션이 0인 주는 NaN 처리하여 선이 이어지지 않거나 빈 값으로 두도록 함)
+weekly_drill_filtered["전환율"] = weekly_drill_filtered.apply(
+    lambda row: (row[curr_col] / row[prev_col] * 100) if row[prev_col] > 0 else float('nan'),
+    axis=1
+)
+
+# 차트 ① (위): 고른 집단만 남긴 뒤, 다른 축으로 나눠서 주별 전환율 선 차트
+fig_drill_line = px.line(
+    weekly_drill_filtered,
+    x="주시작일",
+    y="전환율",
+    color=other_col,
+    markers=True,
+    title=f"① {selected_group}의 주별 {selected_step_name} 전환율 — {other_col}별로 쪼개 보기"
+)
+fig_drill_line.update_layout(yaxis_title="전환율 (%)", xaxis_title="")
+st.plotly_chart(fig_drill_line, width="stretch")
+st.caption("모든 갈래가 같은 시점에 함께 움직였다면, 그 축은 원인이 아닙니다.")
+
+# 차트 ② (아래): 결제 실패 건수 주별 막대 (고른 집단 진한 빨간색 vs 그 외 회색 하나로 합침)
+# 전체 f 데이터에서 주별로 '고른 집단'과 '그 외 집단'의 결제실패 합산 계산
+fail_df = f.groupby(["주시작일", group_col_choice])["결제실패"].sum().reset_index()
+fail_df["구분"] = fail_df[group_col_choice].apply(
+    lambda x: selected_group if x == selected_group else "그 외 집단"
+)
+
+# 주별, 구분별로 다시 합산 (그 외 집단들은 하나로 묶임)
+fail_agg = fail_df.groupby(["주시작일", "구분"])["결제실패"].sum().reset_index()
+
+# 색상 매핑: 고른 집단은 진한 빨간색(#D32F2F), 그 외 집단은 회색(#9E9E9E)
+color_map = {
+    selected_group: "#D32F2F",
+    "그 외 집단": "#9E9E9E"
+}
+
+fig_drill_bar = px.bar(
+    fail_agg,
+    x="주시작일",
+    y="결제실패",
+    color="구분",
+    barmode="group",
+    color_discrete_map=color_map,
+    title=f"주별 결제 실패 건수 ({selected_group} vs 그 외 집단)"
+)
+fig_drill_bar.update_layout(yaxis_title="결제 실패 건수", xaxis_title="")
+st.plotly_chart(fig_drill_bar, width="stretch")
+st.caption("문제가 생긴 시점과 함께 움직였다면 원인 후보입니다. 함께 움직였다고 원인이 확정되지는 않습니다.")
