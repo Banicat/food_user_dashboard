@@ -55,7 +55,7 @@ WITH s AS (                                 -- 세션의 첫 이벤트로 플랫
 SELECT s.주시작일,
        s.platform       AS 플랫폼,
        s.traffic_source AS 유입경로,
-       COUNT(DISTINCT e.session_id)                                                                   AS 세션수,
+       COUNT(DISTINCT e.session_id)                                                                               AS 세션수,
        COUNT(DISTINCT CASE WHEN e.event_name = 'view_restaurant' THEN e.session_id END)   AS 조회세션,
        COUNT(DISTINCT CASE WHEN e.event_name = 'add_to_cart'     THEN e.session_id END)   AS 장바구니세션,
        COUNT(DISTINCT CASE WHEN e.event_name = 'begin_checkout'  THEN e.session_id END)   AS 결제시작세션,
@@ -156,3 +156,81 @@ fig3 = px.bar(ws, x="주문전환율", y="유입경로", orientation="h", text_a
 fig3.update_xaxes(range=[0, ws["주문전환율"].max() * 1.2] if not ws.empty and ws["주문전환율"].max() > 0 else [0, 100])
 fig3.update_layout(xaxis_title="주문 전환율 (%)", yaxis_title="")
 st.plotly_chart(fig3, width="stretch")
+
+st.divider()
+
+# ------------------------------------------------------------
+# 4. 집단 비교 영역
+# ------------------------------------------------------------
+st.header("집단 비교")
+group_col_choice = st.radio("비교 기준", ["플랫폼", "유입경로"], horizontal=True)
+
+# 선택된 기준별로 5단계 퍼널 데이터 집계
+group_df = f.groupby(group_col_choice)[["세션수", "조회세션", "장바구니세션", "결제시작세션", "주문세션"]].sum().reset_index()
+
+# 세션 수가 500개 미만인 집단 확인
+low_session_groups = group_df[group_df["세션수"] < 500][group_col_choice].tolist()
+if low_session_groups:
+    st.caption(f"⚠️ 세션 수가 500개 미만인 집단({', '.join(low_session_groups)})이 있어 값이 크게 흔들릴 수 있습니다.")
+
+# 시각화용 데이터 프레임 변환 (melt)
+melted_df = group_df.melt(
+    id_vars=[group_col_choice],
+    value_vars=["세션수", "조회세션", "장바구니세션", "결제시작세션", "주문세션"],
+    var_name="단계_원래명",
+    value_name="집단세션수"
+)
+
+step_mapping = {
+    "세션수": "1.방문",
+    "조회세션": "2.식당조회",
+    "장바구니세션": "3.장바구니",
+    "결제시작세션": "4.결제시작",
+    "주문세션": "5.주문완료"
+}
+melted_df["단계"] = melted_df["단계_원래명"].map(step_mapping)
+
+# 단계 순서 정렬을 위한 카테고리 설정
+step_order = ["1.방문", "2.식당조회", "3.장바구니", "4.결제시작", "5.주문완료"]
+melted_df["단계"] = pd.Categorical(melted_df["단계"], categories=step_order, ordered=True)
+melted_df = melted_df.sort_values([group_col_choice, "단계"])
+
+# 누적 전환율(%) 계산 (첫 단계 대비 %)
+melted_df["방문세션수"] = melted_df.groupby(group_col_choice)["집단세션수"].transform(lambda x: x.iloc[0])
+melted_df["누적전환율"] = (melted_df["집단세션수"] / melted_df["방문세션수"] * 100).round(1)
+
+# 단계별 전환율(직전 단계 대비 %) 계산
+melted_df["직전세션수"] = melted_df.groupby(group_col_choice)["집단세션수"].shift(1)
+melted_df["단계전환율"] = (melted_df["집단세션수"] / melted_df["직전세션수"] * 100).round(1)
+melted_df.loc[melted_df["단계"] == "1.방문", "단계전환율"] = 100.0
+melted_df.loc[melted_df["단계"] == "1.방문", "직전세션수"] = melted_df.loc[melted_df["단계"] == "1.방문", "집단세션수"]
+
+comp_left, comp_right = st.columns(2)
+
+# 왼쪽: 누적 전환율 퍼널 (px.funnel, x값이 누적 전환율(%))
+with comp_left:
+    fig_comp_funnel = px.funnel(
+        melted_df,
+        x="누적전환율",
+        y="단계",
+        color=group_col_choice,
+        title="누적 전환율 퍼널 (첫 단계 대비 %)"
+    )
+    fig_comp_funnel.update_layout(xaxis_title="누적 전환율 (%)", yaxis_title="")
+    st.plotly_chart(fig_comp_funnel, width="stretch")
+
+# 오른쪽: 단계 전환율 막대 (직전 단계 대비 %, barmode="group")
+with comp_right:
+    fig_comp_bar = px.bar(
+        melted_df,
+        x="단계",
+        y="단계전환율",
+        color=group_col_choice,
+        barmode="group",
+        text="단계전환율",
+        hover_data={"직전세션수": True, "집단세션수": True, "단계전환율": ":.1f"},
+        title="단계 전환율 (직전 단계 대비 %)"
+    )
+    fig_comp_bar.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+    fig_comp_bar.update_layout(yaxis_title="단계 전환율 (%)", xaxis_title="")
+    st.plotly_chart(fig_comp_bar, width="stretch")
