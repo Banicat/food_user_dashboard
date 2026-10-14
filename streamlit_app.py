@@ -1,8 +1,16 @@
+import io
 import sqlite3
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+
+ACCENT, GRAY = "#1F3A5F", "#BDBDBD"        # ← 여기부터 추가
+px.defaults.color_discrete_map = {
+    "Android": ACCENT, "iOS": GRAY,
+    "push": ACCENT, "organic": "#8C8C8C", "paid_ad": GRAY, "referral": "#DADADA",
+}
+px.defaults.color_discrete_sequence = [GRAY]
 
 st.set_page_config(page_title="사용자 행동 탐색 대시보드", layout="wide")
 st.title("사용자 행동 탐색 대시보드")
@@ -18,10 +26,14 @@ NEEDED = {                                # 이번 대시보드에 필요한 테
 }
 
 @st.cache_resource
-def get_db():                             # 필요한 컬럼만 메모리 DB에 올리고, 정제 테이블 events를 만듦 (처음 한 번만)
+def get_db(file_bytes):                   # 필요한 컬럼만 메모리 DB에 올리고, 정제 테이블 events를 만듦 (처음 한 번만)
     con = sqlite3.connect(":memory:", check_same_thread=False)
-    for name, cols in NEEDED.items():
-        pd.read_csv(f"{DATA_DIR}/{name}.csv", usecols=cols).to_sql(name, con, index=False)
+    if file_bytes is not None:
+        df_uploaded = pd.read_csv(io.BytesIO(file_bytes), usecols=NEEDED["app_events"])
+        df_uploaded.to_sql("app_events", con, index=False)
+    else:
+        for name, cols in NEEDED.items():
+            pd.read_csv(f"{DATA_DIR}/{name}.csv", usecols=cols).to_sql(name, con, index=False)
     # 5주차 제외 규칙: QA 계정 제외 · 중복 이벤트 제거
     con.execute("""
         CREATE TABLE events AS
@@ -41,8 +53,8 @@ def get_db():                             # 필요한 컬럼만 메모리 DB에 
 # 1. 데이터 준비 — 정제된 events 테이블을 SQL로 집계
 # ------------------------------------------------------------
 @st.cache_data
-def query(sql):                           # SQL을 실행해 표로 돌려줌
-    return pd.read_sql(sql, get_db())
+def query(sql, file_bytes):               # SQL을 실행해 표로 돌려줌
+    return pd.read_sql(sql, get_db(file_bytes))
 
 # 주 × 플랫폼 × 유입 경로별 세션 퍼널
 SQL_WEEKLY_FUNNEL = """
@@ -55,7 +67,7 @@ WITH s AS (                                 -- 세션의 첫 이벤트로 플랫
 SELECT s.주시작일,
        s.platform     AS 플랫폼,
        s.traffic_source AS 유입경로,
-       COUNT(DISTINCT e.session_id)                                                                                                                                                           AS 세션수,
+       COUNT(DISTINCT e.session_id)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      AS 세션수,
        COUNT(DISTINCT CASE WHEN e.event_name = 'view_restaurant' THEN e.session_id END)   AS 조회세션,
        COUNT(DISTINCT CASE WHEN e.event_name = 'add_to_cart'    THEN e.session_id END)   AS 장바구니세션,
        COUNT(DISTINCT CASE WHEN e.event_name = 'begin_checkout'  THEN e.session_id END)   AS 결제시작세션,
@@ -69,12 +81,44 @@ SELECT s.주시작일,
 """
 
 @st.cache_data
-def load_data():
-    data = query(SQL_WEEKLY_FUNNEL)
+def load_data(file_bytes):
+    data = query(SQL_WEEKLY_FUNNEL, file_bytes)
     data["주시작일"] = pd.to_datetime(data["주시작일"]).dt.date
     return data
 
-df = load_data()                          # 주 × 플랫폼 × 유입 경로별 세션 퍼널
+# 파일 업로드 상태 관리 및 데이터 처리
+uploaded_file = st.session_state.get("upload_file")
+file_bytes = None
+data_source_str = "data 폴더 기본 파일"
+
+if uploaded_file is not None:
+    try:
+        # 헤더만 먼저 읽어서 컬럼 검증
+        sample_df = pd.read_csv(uploaded_file, nrows=0)
+        uploaded_file.seek(0)
+        missing_cols = [col for col in NEEDED["app_events"] if col not in sample_df.columns]
+        
+        if missing_cols:
+            st.error(f"업로드한 파일에 필요한 컬럼이 누락되었습니다: {', '.join(missing_cols)}. 기본 데이터로 대체합니다.")
+            file_bytes = None
+        else:
+            file_bytes = uploaded_file.getvalue()
+            data_source_str = f"올린 파일 {uploaded_file.name}"
+    except Exception as e:
+        st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}. 기본 데이터로 대체합니다.")
+        file_bytes = None
+
+# 업로드 파일 변경 감지 및 필터 초기화 번호 업데이트 처리
+current_file_id = uploaded_file.file_id if uploaded_file is not None else None
+if "last_file_id" not in st.session_state:
+    st.session_state["last_file_id"] = current_file_id
+elif st.session_state["last_file_id"] != current_file_id:
+    st.session_state["last_file_id"] = current_file_id
+    if "filter_version" in st.session_state:
+        st.session_state["filter_version"] += 1
+    st.rerun()
+
+df = load_data(file_bytes)               # 주 × 플랫폼 × 유입 경로별 세션 퍼널
 
 AI_NOTES = {
 "전체": "전체 세션 수는 28,840개이며 주문 전환율은 14.5%, 가장 낮은 단계 전환율은 장바구니 단계의 41.4%이다. 전체 기간 동안 플랫폼과 경로별로 전환 성과에 차이가 나타난 것으로 보인다.",
@@ -129,14 +173,14 @@ selected_traffic_sources = st.sidebar.multiselect(
 # 평소 범위 기준 기간 선택 슬라이더 및 세션 500개 미만 집단 제외 체크박스를 고급 설정 expander 안으로 이동
 default_baseline_end_idx = min(25, len(weeks) - 1)
 with st.sidebar.expander("고급 설정"):
-    baseline_period = st.sidebar.select_slider(
+    baseline_period = st.select_slider(
         "평소 범위 기준 기간",
         options=weeks,
         value=(weeks[0], weeks[default_baseline_end_idx]),
         help="문제가 없던 기간을 고르세요. 이 기간의 주별 주 범위를 '평소 범위'로 씁니다.",
         key=f"baseline_{v}"
     )
-    exclude_low_sessions = st.sidebar.checkbox(
+    exclude_low_sessions = st.checkbox(
         "세션 500개 미만 집단 제외 (집단 비교 · 드릴다운)",
         value=False,
         key=f"exclude_low_{v}"
@@ -182,7 +226,7 @@ with dl_col2:
     )
 
 # ------------------------------------------------------------
-# 1. 제목 아래(탭 위) 보고 있는 조건 표시
+# 1. 제목 아래 조건 표시
 # ------------------------------------------------------------
 if len(selected_period) == 2:
     period_str = f"{selected_period[0]} ~ {selected_period[1]}"
@@ -203,16 +247,20 @@ elif len(selected_traffic_sources) == 0:
 else:
     traffic_str = ", ".join(selected_traffic_sources)
 
-st.caption(f"🔎 보고 있는 조건: 기간 ({period_str}) · 플랫폼 ({platform_str}) · 유입 경로 ({traffic_str})")
+st.caption(f"🔎 보고 있는 조건: 데이터 ({data_source_str}) · 기간 ({period_str}) · 플랫폼 ({platform_str}) · 유입 경로 ({traffic_str})")
+
+# ------------------------------------------------------------
+# 화면 탭 구성 (개요, 탐색, 액션, 데이터 업로드)
+# ------------------------------------------------------------
+tab_overview, tab_explore, tab_action, tab_upload = st.tabs(["📊 개요", "🔍 탐색", "✅ 액션", "📤 데이터 업로드"])
+
+with tab_upload:
+    st.caption("이 탭에서는 분석할 새로운 app_events.csv 파일을 직접 업로드할 수 있습니다.")
+    st.file_uploader("app_events.csv 올리기", type="csv", key="upload_file")
 
 if f.empty:
     st.warning("선택한 조건에 해당하는 데이터가 없습니다. 필터를 바꿔 주세요.")
     st.stop()
-
-# ------------------------------------------------------------
-# 화면 탭 구성 (개요, 탐색, 액션)
-# ------------------------------------------------------------
-tab_overview, tab_explore, tab_action = st.tabs(["📊 개요", "🔍 탐색", "✅ 액션"])
 
 with tab_overview:
     st.caption("이 탭에서는 전체 핵심 지표(KPI)와 주요 전환 성과 흐름을 확인할 수 있습니다.")
@@ -225,9 +273,9 @@ with tab_overview:
 
     t = f[["세션수", "결제시작세션", "주문세션"]].sum()
     c1, c2, c3 = st.columns(3)
-    c1.metric("세션 수", f"{t['세션수']:,}개")
-    c2.metric("주문 전환율 (방문 → 주문)", f"{rate(t['주문세션'], t['세션수']):.1f}%")
-    c3.metric("결제 전환율 (결제 시작 → 주문)", f"{rate(t['주문세션'], t['결제시작세션']):.1f}%")
+    c1.metric("세션 수", f"{t['세션수']:,}개", border=True, help="선택한 조건의 전체 세션의 숫자")
+    c2.metric("누적 주문 전환율", f"{rate(t['주문세션'], t['세션수']):.1f}%", border=True, help="주문 세션 ÷ 전체 세션")
+    c3.metric("결제 단계 전환율", f"{rate(t['주문세션'], t['결제시작세션']):.1f}%", border=True, help="주문 세션 ÷ 결제 시작 세션")
 
     # ------------------------------------------------------------
     # 규칙 기반 설명 문장 (KPI 카드 바로 아래 st.info 추가)
@@ -315,7 +363,7 @@ with tab_overview:
     # ------------------------------------------------------------
     # 3. 차트 (라벨 한국어 및 단위 적용)
     # ------------------------------------------------------------
-    left, right = st.columns(2)
+    left, right = st.columns(2, border=True)
 
     # 3-1. 주별 결제 전환율 (플랫폼별)
     wp = f.groupby(["주시작일", "플랫폼"])[["결제시작세션", "주문세션"]].sum().reset_index()
@@ -362,6 +410,8 @@ with tab_overview:
     )
     fig3.update_xaxes(range=[0, ws["주문전환율"].max() * 1.2] if not ws.empty and ws["주문전환율"].max() > 0 else [0, 100])
     fig3.update_layout(xaxis_title="주문 전환율 (%)", yaxis_title="")
+    fig3.update_traces(marker_color=[ACCENT if s == "push" else GRAY for s in ws["유입경로"]])   # ← 추가
+    fig3.update_xaxes(visible=False)
     st.plotly_chart(fig3, width="stretch")
 
 with tab_explore:
@@ -574,4 +624,61 @@ with tab_explore:
 
 with tab_action:
     st.caption("이 탭에서는 지표 기반 액션 플랜과 개선 과제를 확인할 수 있습니다.")
-    st.caption("액션 카드는 다음 단계에서 추가합니다.")
+    st.caption("측정 KPI의 현재 값은 선택한 기간의 마지막 4주로 계산합니다.")
+
+    # 액션 탭 측정 KPI 계산을 위한 마지막 4주 데이터 추출 (플랫폼/유입경로 필터 무시, 사이드바의 기간(selected_period)만 적용)
+    f_action_base = df[
+        (df["주시작일"] >= selected_period[0]) &
+        (df["주시작일"] <= selected_period[1])
+    ]
+    
+    action_weeks = sorted(f_action_base["주시작일"].unique())
+    if len(action_weeks) >= 4:
+        action_last_4_weeks = action_weeks[-4:]
+        f_action_last4 = f_action_base[f_action_base["주시작일"].isin(action_last_4_weeks)]
+    else:
+        f_action_last4 = f_action_base
+
+    # 카드 1 KPI: 플랫폼이 Android인 데이터의 결제 전환율 (주문세션 ÷ 결제시작세션)
+    f_card1 = f_action_last4[f_action_last4["플랫폼"] == "Android"]
+    t_card1 = f_card1[["결제시작세션", "주문세션"]].sum()
+    card1_val = rate(t_card1["주문세션"], t_card1["결제시작세션"]) if t_card1["결제시작세션"] > 0 else None
+
+    # 카드 2 KPI: 유입경로가 push인 데이터의 방문 → 식당 조회 전환율 (조회세션 ÷ 세션수)
+    f_card2 = f_action_last4[f_action_last4["유입경로"] == "push"]
+    t_card2 = f_card2[["세션수", "조회세션"]].sum()
+    card2_val = rate(t_card2["조회세션"], t_card2["세션수"]) if t_card2["세션수"] > 0 else None
+
+    action_col1, action_col2 = st.columns(2)
+
+    with action_col1:
+        with st.container(border=True):
+            st.markdown("- 문제: 결제 시작에서 주문 전환율이 2026-04-13 주부터 하락해 5월 3주차 최저 41.4%, 6월 1주차부터 회복")
+            st.markdown("- 근거: 같은 기간 iOS는 평소 범위 안 · Android 결제 실패가 주 4건 이하 → 최대 153건")
+            st.markdown("- 성격: 특정 시점에 발생한 문제")
+            st.markdown("- 액션: 추가 분석: 앱 버전별로 결제 실패 확인 → 모니터링: 결제 전환율이 평소 범위를 벗어나는지 매주 점검")
+            st.markdown("- 우선순위: 영향 큼 · 실행 쉬움 → 바로 실행")
+            st.markdown("- **측정 KPI**: Android 결제 전환율 (최근 4주)")
+            st.markdown("- **대시보드에서**: 개요 탭 규칙 문장(플랫폼 Android) · 탐색 탭 드릴다운")
+            
+            if card1_val is not None:
+                st.metric("Android 결제 전환율 (최근 4주)", f"{card1_val:.1f}%")
+            else:
+                st.metric("Android 결제 전환율 (최근 4주)", "데이터 없음")
+            st.caption("대시보드에서: 개요 탭 규칙 문장(플랫폼 Android) · 탐색 탭 드릴다운")
+
+    with action_col2:
+        with st.container(border=True):
+            st.markdown("- 문제: 방문 → 식당 조회 전환율 28.4% (다른 경로 57-69%), 주문 전환율 3.2%")
+            st.markdown("- 근거: 2026년 2월부터 월별 세션의 30-36%가 push · 기간 내내 25-35%")
+            st.markdown("- 성격: 전체 구간에 세그먼트별 반응 차이")
+            st.markdown("- 액션: 실험: 일부 사용자에게만 푸시 대상과 문구를 바꿔 방문 → 식당 조회 전환율 비교")
+            st.markdown("- 우선순위: 효과 불확실 · 실행 쉬움 → 실험부터")
+            st.markdown("- **측정 KPI**: push 방문 → 식당 조회 전환율(최근 4주)")
+            st.markdown("- **대시보드에서**: 탐색 탭 비교 기준 '유입경로' · 드릴다운 push")
+            
+            if card2_val is not None:
+                st.metric("push 방문 → 식당 조회 전환율 (최근 4주)", f"{card2_val:.1f}%")
+            else:
+                st.metric("push 방문 → 식당 조회 전환율 (최근 4주)", "데이터 없음")
+            st.caption("대시보드에서: 탐색 탭 비교 기준 '유입경로' · 드릴다운 push")
